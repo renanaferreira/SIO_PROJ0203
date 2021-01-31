@@ -1,0 +1,11 @@
+pip
+cryptography==3.2.1
+requests==2.23.0
+Twisted==20.3.0
+wheel
+swigibpy
+PyKCS11==1.5.9
+
+
+
+
