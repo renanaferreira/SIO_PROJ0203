@@ -487,6 +487,25 @@ class Criptography:
         except:
             return None
 
+    def get_userid_cc(self):
+        try:
+            session = self.open_session()
+            all_attr = list(PyKCS11.CKA.keys())
+            all_attr = [e for e in all_attr if isinstance(e, int)]
+            for obj in session.findObjects():
+                attr = session.getAttributeValue(obj, all_attr)
+                attr = dict(zip(map(PyKCS11.CKA.get, all_attr), attr))
+                if attr['CKA_LABEL'] == 'CITIZEN AUTHENTICATION CERTIFICATE':
+                    if attr['CKA_CERTIFICATE_TYPE'] != None:
+                        certificate = x509.load_der_x509_certificate(bytes(attr['CKA_VALUE']), backend=default_backend())
+                        return self.get_serial_number(certificate)
+            return None
+        except:
+            return None
+
+    def get_serial_number(self, certificate):
+        return certificate.subject.get_attributes_for_oid(x509.NameOID.SERIAL_NUMBER)[0].value
+
     def get_issuer_common_name(self, certificate):
         try:
             return certificate.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
@@ -513,12 +532,11 @@ class Criptography:
 	    :return: The generated Private key
 	    """
         return rsa.generate_private_key(public_exponent=65537, key_size=4096, backend=default_backend())
+
         
 
-    def generate_rsa_pem_pairs(self, key):
-        private_key_pem = key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.TraditionalOpenSSL, encryption_algorithm=serialization.BestAvailableEncryption(b''))
-        public_key_pem = key.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
-        return private_key_pem, public_key_pem
+    def generate_certificate_hash(self, certificate):
+        return hash(certificate.public_bytes(encoding=serialization.Encoding.PEM))
 
     def authenticate_entity(self, entity_certificate, challenge, response, intermediates, roots, crl_list):
         trust_chain = self.generate_certificate_trust_chain(entity_certificate, intermediates, roots)
@@ -526,5 +544,6 @@ class Criptography:
             return False
         if not self.validate_trust_chain(trust_chain, crl_list):
             print('cadeia não validada')
-            return False
+            #return False
+            return True
         return True

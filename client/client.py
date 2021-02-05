@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat import backends
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from requests.api import request
 
 from security_module import Criptography
 
@@ -55,16 +56,6 @@ for file in crl_files:
     crl_file = open(crl_path + "/" + file, 'rb')
     crls.append(security.load_crl(crl_file.read()))
 
-
-print('certs intermediate:')
-print(intermediate_certs)
-print('certs root:')
-print(root_certs)
-
-
-
-
-
 def main():
     print("|--------------------------------------|")
     print("|         SECURE MEDIA CLIENT          |")
@@ -73,60 +64,89 @@ def main():
     # Get a list of media files
     print("Contacting Server")
 
-    algorithms = [security.encode(cipher) for cipher in security.ciphers]
-    modes = [security.encode(mode) for mode in security.modes]
-    digests = [security.encode(digest) for digest in security.digests]
-    parameters = {
-        "algorithms": algorithms,
-        "modes": modes,
-        "digests": digests
-    }
+    body = security.encode(json.dumps({
+        "algorithms": security.ciphers,
+        "modes": security.modes,
+        "digests": security.digests
+    }))
     
-    req = requests.get(f'{SERVER_URL}/api/protocols', params=parameters)
-    if req.status_code == 400:
-        raise Exception('Unsupported encryption modules')
-    else:
-        print("Cipher Suite selection")
+    req = requests.post(f'{SERVER_URL}/api/protocols', data=body)
 
-    parameters = req.json()
-    print(f"Cipher Suite & tokenId: {parameters}")
 
-    tokenId = parameters["tokenId"]
-    cipher  = parameters["cipher"]
-    mode    = parameters["mode"]
-    digest  = parameters["digest"]
+    if req.status_code == 500:
+        print('error')
+        exit(0)
+        
+    print("Cipher Suite selection")
+
+    body = json.loads(security.decode(req.content))
+    print(f"Cipher Suite & tokenId: {body}")
+
+    tokenId = body["tokenId"]
+    cipher  = body["cipher"]
+    mode    = body["mode"]
+    digest  = body["digest"]
 
     
     p, g, private_key, public_key_pem = security.DH_creation()
-    parameters = {'tokenId': tokenId,
-                  'p': security.encode(str(p)), 
-                  'g': security.encode(str(g)), 
-                  'pk_pem': public_key_pem}
+    body = security.encode(json.dumps({'tokenId': tokenId, 'p': p, 
+                  'g': g, 'pk_pem': security.decode(public_key_pem)}))
 
-    req = requests.get(f'{SERVER_URL}/api/key', params=parameters)
+    req = requests.post(f'{SERVER_URL}/api/key', data=body)
+    if req.status_code == 500:
+        print('error')
+        exit(0)
 
-    server_pk_pem = security.encode(req.json()['pk_pem'])
-    shared_key = security.generate_shared_key(private_key, server_pk_pem, digest)
+    body = json.loads(security.decode(req.content))
+
+    shared_key = security.generate_shared_key(private_key, security.encode(body['pk_pem']), digest)
 
     challenge_nonce = os.urandom(16)
     message = security.compose_message(cipher, mode, digest, shared_key, challenge_nonce)
 
-    parameters = {'tokenId': tokenId}
-    req = requests.post(f'{SERVER_URL}/api/auth?step=1', params=parameters, data=message)
+    body = security.encode(json.dumps({'tokenId': tokenId, 'data': security.decode(message)}))
+    req = requests.post(f'{SERVER_URL}/api/auth?step=1', data=body)
+    if req.status_code == 500:
+        print('error')
+        exit(0)
+
+
     body = json.loads(security.decode(security.decompose_message(cipher, mode, digest, shared_key, req.content)))
     challenge_response = security.encode(body["response"])
     server_certificate = security.load_certificate(security.encode(body['certificate']))
     challlenge = security.encode(body['challenge'])
 
-    print('deu certo')
-    print(security.validate_certificate_signature(server_certificate, list(root_certs.values())[0]))
-
     validated = security.authenticate_entity(server_certificate, challenge_nonce, challenge_response, intermediate_certs, root_certs, crls)
+    if not validated:
+        print('Server não foi autenticado')
+        exit(0)
 
-    print(f'valido? {validated}')
-    exit(0)
+    print('teste')
+    nonce_teste = os.urandom(16)
+    user_certificate = security.get_certificate_cc()
+    response_teste = security.generate_signature_cc(challlenge)
+    print(f'valido? {security.validate_signature(response_teste, nonce_teste, user_certificate.public_key())}')
     
-    req = requests.get(f'{SERVER_URL}/api/list', params=parameters)
+    user_certificate = security.get_certificate_cc()
+    certificate_pem = security.pack_certificate_pem(user_certificate)
+    challenge_response = security.generate_signature_cc(challlenge)
+    userid = security.decode(security.get_userid_cc())
+    body = security.encode(json.dumps({'certificate': certificate_pem, 'response': challenge_response, 'id': userid}))
+    message = security.compose_message(cipher, mode, digest, shared_key, body)
+
+    body = security.encode(json.dumps({'tokenId': tokenId, 'data': security.decode(message)}))
+    req = requests.post(f'{SERVER_URL}/api/auth?step=2', params=body,data=message)
+    if req.status_code == 500:
+        print('error')
+        exit(0)
+
+    message = security.decompose_message(cipher, mode, digest, shared_key, request.content)
+    print('aquuuuuuuu')
+    print(message)
+
+
+    
+    req = requests.get(f'{SERVER_URL}/api/list', params=body)
     if req.status_code == 200:
         print("Got Server List")
 

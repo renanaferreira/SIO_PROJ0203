@@ -10,6 +10,8 @@ import json
 import os
 import math
 import random
+from datetime import datetime
+from datetime import timedelta as delta
 
 from security_module import Criptography
 
@@ -53,7 +55,7 @@ class MediaServer(resource.Resource):
         super().__init__()
         self.security = Criptography()
         self.clients = dict()
-        self.nonces = dict()
+        self.users = dict()
 
         self.private_rsa_key = self.security.load_private_key(private_key)
         self.server_certificate = self.security.load_certificate(server_cert)
@@ -142,21 +144,20 @@ class MediaServer(resource.Resource):
     def do_get_shared_key(self, request):
         logger.debug("DH KEY Exchange")
 
-        tokenId = self.security.decode(request.args.get(b'tokenId')[0],)
+        body = json.loads(self.security.decode(request.content.read()))
+        tokenId = body['tokenId']
         logger.debug(f"Key: session: tokenId: {tokenId}")
 
-        request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-
         if not tokenId in self.clients:
-            request.setResponseCode(405)
+            request.setResponseCode(500)
             return json.dumps({'issue': 'You must first initiate session on /api/protocols'}).encode('latin')
 
         client = self.clients[tokenId]
 
-        p = int(self.security.decode(request.args.get(b'p')[0]))
-        g = int(self.security.decode(request.args.get(b'g')[0]))
+        p = int(body['p'])
+        g = int(body['g'])
         private_key, my_pk_pem = self.security.DH_adaptation(p, g)
-        key = self.security.generate_shared_key(private_key, request.args.get(b'pk_pem')[0], self.clients[tokenId]['cs'][2])
+        key = self.security.generate_shared_key(private_key, self.security.encode(body['pk_pem']), self.clients[tokenId]['cs'][2])
 
         self.clients[tokenId]["dh"] = key
         self.clients[tokenId]['state'] = STATE_DHK
@@ -168,13 +169,14 @@ class MediaServer(resource.Resource):
 
 
     def do_auth(self, request):
-        tokenId = self.security.decode(request.args.get(b'tokenId')[0])
+        body = json.loads(self.security.decode(request.content.read()))
+        tokenId = body['tokenId']
+
         logger.debug(f"Key: session: tokenId: {tokenId}")
 
         if not tokenId in self.clients:
-            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-            request.setResponseCode(405)
-            return json.dumps({'issue': 'You must first initiate session on /api/protocols'}).encode('latin')
+            request.setResponseCode(500)
+            return self.security(json.dumps({'issue': 'You must first initiate session on /api/protocols'}))
 
         client = self.clients[tokenId]
         key = client['dh']
@@ -184,24 +186,52 @@ class MediaServer(resource.Resource):
         digest = client['cs'][2]
 
         if client['state'] < STATE_DHK:
-            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-            request.setResponseCode(405)
-            return json.dumps({'issue': 'You must first authenticate DH Shared key in /api/key'}).encode('latin')
+            request.setResponseCode(500)
+            return self.security(json.dumps({'issue': 'You must first authenticate DH Shared key in /api/key'}))
 
         step = self.security.decode(request.args.get(b'step')[0])
         if step == '1':
-            message = request.content.read()
+            message = self.security.encode(body['data'])
             logger.debug(f'message:   {message}')
             challenge_nonce = self.security.decompose_message(cipher, mode, digest, key, message)
             challenge_response = self.security.generate_rsa_signature(challenge_nonce, self.private_rsa_key)
             nonce = os.urandom(16)
-            self.nonces[tokenId] = nonce
+            self.clients[tokenId]['nonce'] = nonce
             data = json.dumps({'response':self.security.decode(challenge_response), 
                                'certificate': self.security.decode(self.security.pack_certificate_pem(self.server_certificate)), 
                                'challenge': self.security.decode(nonce)}).encode('latin')
             return self.security.compose_message(cipher, mode, digest, key, data)
         elif step == '2':
-            pass
+            message = self.security.encode(body['data'])
+            logger.debug(f'message:   {message}')
+            body = json.loads(self.security.decode(self.security.decompose_message(cipher, mode, digest, key, message)))
+            response = self.security.encode(body['response'])
+            userid = self.security.encode(body['id'])
+            certificate = self.security.load_certificate(self.security.encode(body['certificate']))
+            validated = self.security.authenticate_entity(certificate,  self.clients[tokenId]['nonce'], response, self.intermediate_certificates, self.root_certificates, self.crl_list)
+            if validated:
+                if not userid in self.users:
+                    self.users[userid] = dict()
+                    self.users[userid]['certificate'] = certificate
+                    self.users[userid]['licenses'] = dict()
+                    for media_id in CATALOG:
+                        self.users[userid]['licenses']['views'] = 100
+                        self.users[userid]['licenses']['from'] = datetime.now()
+                        self.users[userid]['licenses']['until'] = datetime.now() + delta(days=2)
+                else:
+                    if certificate != self.users[userid]['certificate']:
+                        self.users[userid]['certificate'] = certificate
+                body = self.security.encode(json.dumps({'status': 'OK'}))
+                message = self.security.compose_message(cipher, mode, digest, key, body)
+                return message
+            else:
+                body = self.security.encode(json.dumps({'status':'unvalid'}))
+                return self.security.compose_message(cipher, mode, digest, key, body)
+        else:
+            request.setResponseCode(405)
+            body = self.security.encode(json.dumps({'error': 'unespecified parameter step'}))
+            return self.security.compose_message(cipher, mode, digest, key, body)
+
 
 
     def do_get_protocols(self, request):
@@ -211,17 +241,18 @@ class MediaServer(resource.Resource):
         tokenId = token_urlsafe(10)
         while tokenId in self.clients:
             tokenId = token_urlsafe(10)
-        print(f'o tipo é {type(tokenId)}')
 
         self.clients[tokenId] = dict()
         self.clients[tokenId]['state'] = STATE_CONNECT
 
         logger.debug(f"Client state: {self.clients[tokenId]['state']}")
         logger.debug(f"Protocols: TokenId: {tokenId}")
+
+        body = json.loads(self.security.decode(request.content.read()))
         
-        algorithms = [self.security.decode(item) for item in request.args.get(b'algorithms')]
-        modes      = [self.security.decode(item) for item in request.args.get(b'modes')     ]
-        digests    = [self.security.decode(item) for item in request.args.get(b'digests')   ]
+        algorithms = body['algorithms']
+        modes      = body['modes']    
+        digests    = body['digests']
 
         logger.debug(f"Cipher Algorithms: {algorithms}")
         logger.debug(f"Cipher Modes: {modes}")
@@ -233,10 +264,12 @@ class MediaServer(resource.Resource):
 
         self.clients[tokenId]["cs"] = [cipher, mode, digest]
         
-        request.responseHeaders.addRawHeader(b"content-type", b"application/json")
+        
         if cipher == None or mode == None or digest == None:
+            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
             request.setResponseCode(500)
-            return json.dumps({'error': 'Not supported encryption functions'}).encode('latin')
+            return self.security.decode(json.dumps({'error': 'Not supported encryption functions'}))
+
         parameters = {
             'tokenId': tokenId,
             'cipher': cipher,
@@ -248,9 +281,9 @@ class MediaServer(resource.Resource):
 
         self.clients[tokenId]['state'] = STATE_CS
 
-        logger.debug(f"Client stsignate: {self.clients[tokenId]['state']}")
+        logger.debug(f"Client state: {self.clients[tokenId]['state']}")
 
-        return json.dumps(parameters, indent=4).encode('latin')
+        return self.security.encode(json.dumps(parameters))
 
     # Send the list of media files to clients
     def do_list(self, request):
@@ -371,37 +404,17 @@ class MediaServer(resource.Resource):
         request.responseHeaders.addRawHeader(b"content-type", b"application/json")
         return json.dumps({'error': 'unknown'}, indent=4).encode('latin')
 
-    # Handle a GET request
-    def render_GET(self, request):
-        logger.debug(f'Received request for {request.uri}')
-
-        try:
-            
-            #elif request.uri == '':
-            #...
-            #elif request.uri == 'api/auth':
-
-            
-            if request.path == b'/api/protocols':
-                return self.do_get_protocols(request)
-            elif request.path == b'/api/key':
-                return self.do_get_shared_key(request)
-            else:
-                request.responseHeaders.addRawHeader(b"content-type", b'text/plain')
-                return b'Methods:  /api/protocols /api/key /api/auth /api/list /api/download'
-
-        except Exception as e:
-            logger.exception(e)
-            request.setResponseCode(500)
-            request.responseHeaders.addRawHeader(b"content-type", b"text/plain")
-            return b''
     
     # Handle a POST request
     def render_POST(self, request):
         logger.debug(f'Received request for {request.uri}')
 
-        try:            
-            if request.path == b'/api/auth':
+        try:
+            if request.path == b'/api/protocols':
+                return self.do_get_protocols(request)
+            elif request.path == b'/api/key':
+                return self.do_get_shared_key(request)
+            elif request.path == b'/api/auth':
                 return self.do_auth(request)
             elif request.path == b'/api/list':
                 return self.do_list(request)
