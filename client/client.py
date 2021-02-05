@@ -128,19 +128,20 @@ def main():
     print(f'valido? {security.validate_signature(response_teste, nonce_teste, user_certificate.public_key())}')
     
     user_certificate = security.get_certificate_cc()
-    certificate_pem = security.pack_certificate_pem(user_certificate)
-    challenge_response = security.generate_signature_cc(challlenge)
-    userid = security.decode(security.get_userid_cc())
+    certificate_pem = security.decode(security.pack_certificate_pem(user_certificate))
+    challenge_response = security.decode(security.generate_signature_cc(challlenge))
+    userid = security.get_userid_cc()
+    print(userid)
     body = security.encode(json.dumps({'certificate': certificate_pem, 'response': challenge_response, 'id': userid}))
     message = security.compose_message(cipher, mode, digest, shared_key, body)
 
     body = security.encode(json.dumps({'tokenId': tokenId, 'data': security.decode(message)}))
-    req = requests.post(f'{SERVER_URL}/api/auth?step=2', params=body,data=message)
+    req = requests.post(f'{SERVER_URL}/api/auth?step=2',data=body)
     if req.status_code == 500:
         print('error')
         exit(0)
 
-    message = security.decompose_message(cipher, mode, digest, shared_key, request.content)
+    message = security.decompose_message(cipher, mode, digest, shared_key, req.content)
     print('aquuuuuuuu')
     print(message)
 

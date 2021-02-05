@@ -192,7 +192,6 @@ class MediaServer(resource.Resource):
         step = self.security.decode(request.args.get(b'step')[0])
         if step == '1':
             message = self.security.encode(body['data'])
-            logger.debug(f'message:   {message}')
             challenge_nonce = self.security.decompose_message(cipher, mode, digest, key, message)
             challenge_response = self.security.generate_rsa_signature(challenge_nonce, self.private_rsa_key)
             nonce = os.urandom(16)
@@ -203,10 +202,10 @@ class MediaServer(resource.Resource):
             return self.security.compose_message(cipher, mode, digest, key, data)
         elif step == '2':
             message = self.security.encode(body['data'])
-            logger.debug(f'message:   {message}')
             body = json.loads(self.security.decode(self.security.decompose_message(cipher, mode, digest, key, message)))
             response = self.security.encode(body['response'])
-            userid = self.security.encode(body['id'])
+            userid = body['id']
+            logger.debug(f'userid: {userid}')
             certificate = self.security.load_certificate(self.security.encode(body['certificate']))
             validated = self.security.authenticate_entity(certificate,  self.clients[tokenId]['nonce'], response, self.intermediate_certificates, self.root_certificates, self.crl_list)
             if validated:
@@ -222,6 +221,7 @@ class MediaServer(resource.Resource):
                     if certificate != self.users[userid]['certificate']:
                         self.users[userid]['certificate'] = certificate
                 body = self.security.encode(json.dumps({'status': 'OK'}))
+                logger.debug(f'you are authenticated: {body}')
                 message = self.security.compose_message(cipher, mode, digest, key, body)
                 return message
             else:
