@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from twisted.python.reflect import modgrep
 from twisted.web import server, resource
 from twisted.internet import reactor, defer
 from secrets import token_urlsafe
@@ -13,6 +14,9 @@ import random
 from datetime import datetime
 from datetime import timedelta as delta
 
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.backends import default_backend
+
 from security_module import Criptography
 
 logger = logging.getLogger('root')
@@ -25,6 +29,14 @@ STATE_CONNECT = 0
 STATE_CS = 1
 STATE_DHK = 2
 STATE_SERVER_AUTH = 3
+STATE_CLI_AUTH = 4
+
+BLOCK_LEN = 16
+
+reader = open('server/key.bin','rb')
+catalogEncKey = reader.read()
+
+
 
 
 CATALOG = { '898a08080d1840793122b7e118b27a95d117ebce': 
@@ -38,7 +50,7 @@ CATALOG = { '898a08080d1840793122b7e118b27a95d117ebce':
             }
         }
 
-CATALOG_BASE = 'catalog'
+CATALOG_BASE = 'server/enc_catalog'
 CHUNK_SIZE = 1024 * 4
 SERVER_PORT = 8081
 
@@ -59,6 +71,13 @@ class MediaServer(resource.Resource):
 
         self.private_rsa_key = self.security.load_private_key(private_key)
         self.server_certificate = self.security.load_certificate(server_cert)
+
+        '''
+        reader = open('server/ServerKey.pem','rb')
+        catalogKey = self.security.generate_derived_key(reader.read(), b'')
+        writer = open('key.bin','wb')
+        writer.write(catalogKey)
+        '''
 
         self.intermediate_certificates = dict()
         for cert in intermediate_certs:
@@ -207,7 +226,7 @@ class MediaServer(resource.Resource):
             userid = body['id']
             logger.debug(f'userid: {userid}')
             certificate = self.security.load_certificate(self.security.encode(body['certificate']))
-            validated = self.security.authenticate_entity(certificate,  self.clients[tokenId]['nonce'], response, self.intermediate_certificates, self.root_certificates, self.crl_list)
+            validated = self.security.authenticate_entity(certificate,  self.clients[tokenId]['nonce'], response, self.intermediate_certificates, self.root_certificates, self.crl_list, CC=True)
             if validated:
                 if not userid in self.users:
                     self.users[userid] = dict()
@@ -289,36 +308,37 @@ class MediaServer(resource.Resource):
     def do_list(self, request):
 
         logger.debug("Media List")
+        data = json.loads(self.security.decode(request.content.read()))
 
-        tokenId = request.args.get(b'tokenId')[0].decode('latin')
+        tokenId = data['tokenId']
+        data = self.security.encode(data['data'])
         logger.debug(f"List: session: tokenId: {tokenId}")
 
-        
-
         if not tokenId in self.clients:
-            request.setResponseCode(405)
-            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
+            request.setResponseCode(500)
             return json.dumps({'issue': 'You must first initiate session on /api/protocols'}).encode('latin')
 
-        if self.clients[tokenId]['state'] != STATE_DHK:
-            request.setResponseCode(405)
-            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-            return json.dumps({'issue': 'You must first establish DF Key exchange on /api/key'}).encode('latin')
+        client = self.clients[tokenId]
+        key = self.clients[tokenId]['dh']
 
-        privkey = self.clients[tokenId]['DH']['my_privkey']
-        pk_pem = self.clients[tokenId]['DF_key_exchange']['client_pk_pem']
+        cipher = client['cs'][0]
+        mode   = client['cs'][1]
+        digest = client['cs'][2]
 
-        cipher = self.clients[tokenId]['cs'][0]
-        mode   = self.clients[tokenId]['cs'][1]
-        digest = self.clients[tokenId]['cs'][2]        
-
-        #auth = request.getHeader('Authorization')
-        #if not auth:
-        #    request.setResponseCode(401)
-        #    return 'Not authorized'
-
-
-
+        message = json.loads(self.security.decode(self.security.decompose_message(cipher, mode, digest, key, data)))
+        userid = message['id']
+        data = self.security.encode(message['data'])
+        if not userid in self.users:
+            request.setResponseCode(500)
+            body = self.security.encode(json.dumps({'error':'you must authenticate'}))
+            return self.security.compose_message(cipher, mode, digest, key, body)
+        user = self.users[userid]
+        public_key = user['certificate'].public_key()
+        message = self.security.decode(self.security.decompose_auth_message(data, public_key, CC=True))
+        if message == None:
+            request.setResponseCode(500)
+            body = self.security.encode(json.dumps({'error':'invalid signature'}))
+            return self.security.compose_message(cipher, mode, digest, key, body)       
 
         # Build list
         media_list = []
@@ -332,11 +352,9 @@ class MediaServer(resource.Resource):
                 'duration': media['duration']
                 })
 
-        data = json.dumps(media_list, indent=4).encode('latin')
-        message = self.security_module.encrypt(cipher_alg, cipher_mode, digest_alg, data, privkey, pk_pem)
-
-        self.clients[tokenId]['state'] = STATE_SERVER_AUTH
-        logger.debug(f"Client state: {self.clients[tokenId]['state']}")
+        data = self.security.encode(json.dumps(media_list, indent=4))
+        message = self.security.compose_auth_message(data, self.private_rsa_key)
+        message = self.security.compose_message(cipher, mode, digest, key, message)
 
         # Return list to client
         return message
@@ -345,8 +363,39 @@ class MediaServer(resource.Resource):
     # Send a media chunk to the client
     def do_download(self, request):
         logger.debug(f'Download: args: {request.args}')
+        message = json.loads(self.security.decode(request.content.read()))
+        tokenId = message['tokenId']
+        if tokenId not in self.clients:
+            request.setResponseCode(500)
+            return json.dumps({'issue': 'You must first initiate session on /api/protocols'}).encode('latin')
+
+        client = self.clients[tokenId]
+
+        cipher = client['cs'][0]
+        mode = client['cs'][1]
+        digest = client['cs'][2]
+        key = client['dh']
+
+        message = json.loads(self.security.decode(self.security.decompose_message(cipher, mode, digest, key, message['data'])))
+        userid = message['id']
+        message = message['data']
+
+        if not userid in self.users:
+            request.setResponseCode(500)
+            body = self.security.encode(json.dumps({'error':'you must authenticate'}))
+            return self.security.compose_message(cipher, mode, digest, key, body)
         
-        media_id = request.args.get(b'id', [None])[0]
+        user = self.users[userid]
+        user_cert = user['certificate']
+        message = self.security.decode(self.security.decompose_auth_message(message, user_cert.public_key(), CC=True))
+        if message == None:
+            request.setResponseCode(500)
+            body = self.security.encode(json.dumps({'error':'invalid signature'}))
+            return self.security.compose_message(cipher, mode, digest, key, body) 
+  
+        
+        body = json.loads(message)
+        media_id = body['id']
         logger.debug(f'Download: id: {media_id}')
 
         # Check if the media_id is not None as it is required
@@ -354,9 +403,6 @@ class MediaServer(resource.Resource):
             request.setResponseCode(400)
             request.responseHeaders.addRawHeader(b"content-type", b"application/json")
             return json.dumps({'error': 'invalid media id'}).encode('latin')
-        
-        # Convert bytes to str
-        media_id = media_id.decode('latin')
 
         # Search media_id in the catalog
         if media_id not in CATALOG:
@@ -368,10 +414,10 @@ class MediaServer(resource.Resource):
         media_item = CATALOG[media_id]
 
         # Check if a chunk is valid
-        chunk_id = request.args.get(b'chunk', [b'0'])[0]
+        chunk_id = body['chunk']
         valid_chunk = False
         try:
-            chunk_id = int(chunk_id.decode('latin'))
+            chunk_id = int(chunk_id)
             if chunk_id >= 0 and chunk_id  < math.ceil(media_item['file_size'] / CHUNK_SIZE):
                 valid_chunk = True
         except:
@@ -381,24 +427,54 @@ class MediaServer(resource.Resource):
             request.setResponseCode(400)
             request.responseHeaders.addRawHeader(b"content-type", b"application/json")
             return json.dumps({'error': 'invalid chunk id'}).encode('latin')
+        
+        licenses = user['licenses']
+        if licenses['views'] <= 0:
+            logger.debug(f'view acabaram: {licenses["views"]}')
+            request.setResponseCode(400)
+            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
+            return json.dumps({'error': 'no license'}).encode('latin')
+        
+        if licenses["until"] <= datetime.now():
+            logger.debug(f'now: {datetime.now()} allowed until: {licenses["until"]}')
+            request.setResponseCode(400)
+            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
+            return json.dumps({'error': 'no license'}).encode('latin')
+
+        
+        licenses['views'] += -1
+        logger.debug(f'user: {userid}, views: {licenses["views"]}')   
+
             
         logger.debug(f'Download: chunk: {chunk_id}')
 
-        offset = chunk_id * CHUNK_SIZE
+        last_chunk = (chunk_id == math.ceil(media_item['file_size'] / CHUNK_SIZE) -1)
+        logger.debug(f'last chunk? {last_chunk},   {math.ceil(media_item["file_size"] / CHUNK_SIZE)} ')
+        offset = chunk_id * CHUNK_SIZE + BLOCK_LEN
 
         # Open file, seek to correct position and return the chunk
         with open(os.path.join(CATALOG_BASE, media_item['file_name']), 'rb') as f:
+            nonce = f.read(BLOCK_LEN)
+            print(f'nonce: {nonce}')
             f.seek(offset)
-            data = f.read(CHUNK_SIZE)
+            data = b''
+            while len(data) != CHUNK_SIZE:
+                data += self.security.decryption_file(f.read(BLOCK_LEN),nonce,catalogEncKey)
+            
 
-            request.responseHeaders.addRawHeader(b"content-type", b"application/json")
-            return json.dumps(
+
+            data = self.security.encode(json.dumps(
                     {
                         'media_id': media_id, 
                         'chunk': chunk_id, 
                         'data': binascii.b2a_base64(data).decode('latin').strip()
                     },indent=4
-                ).encode('latin')
+                ))
+            
+
+            derived_key = self.security.generate_derived_key(key, bytes(str(chunk_id)+media_id, 'latin'))
+            message = self.security.compose_auth_message(data, self.private_rsa_key)
+            return self.security.compose_message(cipher, mode, digest, derived_key, message)
 
         # File was not open?
         request.responseHeaders.addRawHeader(b"content-type", b"application/json")
@@ -469,9 +545,6 @@ crl_path_bytes = []
 for file in crl_files:
     cert_file = open(crl_path + "/" + file, "rb")
     crl_path_bytes.append(cert_file.read())
-
-
-
 
 s = server.Site(MediaServer(private_key_bytes, cert_bytes, itmdt_certs_bytes, root_certs_bytes, crl_path_bytes))
 reactor.listenTCP(SERVER_PORT, s)

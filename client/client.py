@@ -26,6 +26,9 @@ SERVER_PORT = 8081
 SERVER_URL = 'http://127.0.0.1:'+str(SERVER_PORT)
 TIMEOUT = 1000
 
+CHUNK_SIZE = 1024*4
+CATALOG = 'server/catalog'
+
 security = Criptography()
 
 intermediate_path = 'certificates/client_intermediates'
@@ -121,13 +124,14 @@ def main():
         print('Server não foi autenticado')
         exit(0)
 
-    print('teste')
+    '''print('teste')
     nonce_teste = os.urandom(16)
     user_certificate = security.get_certificate_cc()
     response_teste = security.generate_signature_cc(challlenge)
     print(f'valido? {security.validate_signature(response_teste, nonce_teste, user_certificate.public_key())}')
-    
+    '''
     user_certificate = security.get_certificate_cc()
+    print(f'user: {user_certificate}')
     certificate_pem = security.decode(security.pack_certificate_pem(user_certificate))
     challenge_response = security.decode(security.generate_signature_cc(challlenge))
     userid = security.get_userid_cc()
@@ -141,20 +145,26 @@ def main():
         print('error')
         exit(0)
 
-    message = security.decompose_message(cipher, mode, digest, shared_key, req.content)
-    print('aquuuuuuuu')
+    message = security.decode(security.decompose_message(cipher, mode, digest, shared_key, req.content))
     print(message)
-
+    body = security.encode(userid)
+    message = security.decode(security.compose_auth_message(body, CC=True))
+    body = security.encode(json.dumps({'id': userid, 'data': message}))
+    message = security.compose_message(cipher, mode, digest, shared_key, body)
+    body = security.encode(json.dumps({'tokenId': tokenId, 'data': security.decode(message)}))
 
     
-    req = requests.get(f'{SERVER_URL}/api/list', params=body)
+    req = requests.post(f'{SERVER_URL}/api/list', data=body)
     if req.status_code == 200:
         print("Got Server List")
 
-    plaintext = security.decompose_message(cipher, mode, digest, shared_key, req.content)
-    if plaintext == None:
-        print("Errro!!!!!!!!")
-    media_list = json.loads(plaintext)
+    message = security.decompose_message(cipher, mode, digest, shared_key, req.content)
+    message = security.decompose_auth_message(message, server_certificate.public_key())
+
+    if message == None:
+        exit(1)
+    media_list = json.loads(message)
+    print(media_list)
 
 
     # Present a simple selection menu    
@@ -186,19 +196,42 @@ def main():
     if os.name == 'nt':
         proc = subprocess.Popen(['ffplay.exe', '-i', '-'], stdin=subprocess.PIPE)
     else:
-        proc = subprocess.Popen(['ffplay', '-i', '-'], stdin=subprocess.PIPE)
+        print('aqui')
+        #proc = subprocess.Popen(['ffplay', '-i', '-'], stdin=subprocess.PIPE)
 
     # Get data from server and send it to the ffplay stdin through a pipe
     for chunk in range(media_item['chunks'] + 1):
-        req = requests.get(f'{SERVER_URL}/api/download?id={media_item["id"]}&chunk={chunk}')
-        chunk = req.json()
-       
+        chunk_num = chunk
+        body = security.encode(json.dumps({'id': media_item["id"], 'chunk': chunk}))
+        body = security.decode(security.compose_auth_message(body,CC=True))
+        body = security.encode(json.dumps({'id': userid, 'data': body}))
+        body = security.decode(security.compose_message(cipher, mode, digest, shared_key, body))
+        body = security.encode(json.dumps({'tokenId': tokenId, 'data': body}))
+        
+        req = requests.post(f'{SERVER_URL}/api/download', data=body)
+        if req.status_code != 200:
+            print(req.content)
+            print('fim')
+            exit(0)
+        derived_key = security.generate_derived_key(shared_key, bytes(str(chunk)+media_item['id'],'latin'))
+
+        data = security.decompose_message(cipher, mode, digest, derived_key, req.content)
+        data = security.decode(security.decompose_auth_message(data, server_certificate.public_key()))
+        chunk_data = json.loads(data)
+
         # TODO: Process chunk
 
-        data = binascii.a2b_base64(chunk['data'].encode('latin'))
+        reader = open(os.path.join(CATALOG, media_item['id'])+'.mp3', 'rb')
+        offset = CHUNK_SIZE*int(chunk)
+        reader.seek(offset)
+        new_chunk = reader.read(CHUNK_SIZE)
+
+        data = binascii.a2b_base64(chunk_data['data'].encode('latin'))
         try:
-            proc.stdin.write(data)
+            print(f'valido chunk? {new_chunk==data}')
+            #proc.stdin.write(data)
         except:
+            print('houve um problema na ligação ao media')
             break
 
 if __name__ == '__main__':

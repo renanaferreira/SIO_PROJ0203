@@ -34,6 +34,7 @@ BLAKE2 = "BLAKE2"
 CHACHA_NONCE_LENGTH = 16
 GCM_IV_LENGTH = 12
 TAG_LENGTH = 16
+RSA_SHA256_LENGTH = 256
 
 PKCS11 = '/usr/local/lib/libpteidpkcs11.so'
 
@@ -200,6 +201,37 @@ class Criptography:
         mac = self.generate_mac(key, digest, data_for_mac)
 
         return base64.b64encode(mac + data_for_mac)
+    
+    def compose_auth_message(self, data, private_key=None, CC=False):
+        if CC:
+            signature = self.generate_signature_cc(data)
+        else:
+            if private_key == None:
+                return None
+            signature = self.generate_rsa_signature(data, private_key)
+        return base64.b64encode(signature + data)
+
+    def decompose_auth_message(self, data, public_key, CC=False, debug=False):
+        data = base64.b64decode(data)
+        if CC:
+            data, signature = self.get_offset(data, 384)
+            if not self.validate_signature(signature, data, public_key):
+                if debug:
+                    return None
+                return None
+            return data
+        else:
+            data, signature = self.get_offset(data, RSA_SHA256_LENGTH)
+            if not self.validate_rsa_signature(signature, data, public_key):
+                return None
+            return data
+
+    def generate_derived_key(self, key, info):
+        return HKDF(algorithm=hashes.SHA256(),
+            length=32,salt=None,info=info,
+            backend=default_backend()
+        ).derive(key)
+        
 
     def decompose_message(self, algorithm, mode, digest, key, data):
         data = base64.b64decode(data)
@@ -340,6 +372,11 @@ class Criptography:
 	    """
         return private_key.sign(data, asy_padding.PSS(mgf=asy_padding.MGF1(hashes.SHA256()), salt_length=asy_padding.PSS.MAX_LENGTH), hashes.SHA256())
 
+    def decryption_file(self, block, nonce,key):
+        cipher  = Cipher(algorithms.ChaCha20(key, nonce),mode=None, backend=default_backend())
+        decryptor = cipher.decryptor()
+        data = decryptor.update(block) + decryptor.finalize()
+        return data
 
     def validate_rsa_signature(self, signature, data, public_key):
         try:
@@ -365,7 +402,7 @@ class Criptography:
 
     def validate_signature(self, signature, data, public_key, hash_algorithm=hashes.SHA1()):
         try:
-            public_key.verify(signature, data, padding.PKCS1v15(), hash_algorithm)
+            public_key.verify(signature, data, asy_padding.PKCS1v15(), hash_algorithm)
             return True
         except:
             return False
@@ -482,8 +519,8 @@ class Criptography:
 
             private_key = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY),(PyKCS11.CKA_LABEL, "CITIZEN AUTHENTICATION KEY")])[0]
             mechanism = PyKCS11.Mechanism(PyKCS11.CKM_SHA1_RSA_PKCS, None)
-
-            return bytes(session.sign(private_key, data, mechanism))
+            signature = bytes(session.sign(private_key, data, mechanism))
+            return signature
         except:
             return None
 
@@ -538,12 +575,14 @@ class Criptography:
     def generate_certificate_hash(self, certificate):
         return hash(certificate.public_bytes(encoding=serialization.Encoding.PEM))
 
-    def authenticate_entity(self, entity_certificate, challenge, response, intermediates, roots, crl_list):
+    def authenticate_entity(self, entity_certificate, challenge, response, intermediates, roots, crl_list, CC=False):
         trust_chain = self.generate_certificate_trust_chain(entity_certificate, intermediates, roots)
-        if not self.validate_rsa_signature(response, challenge, entity_certificate.public_key()):
-            return False
         if not self.validate_trust_chain(trust_chain, crl_list):
-            print('cadeia não validada')
-            #return False
-            return True
+            return False
+        if CC:
+            if not self.validate_signature(response, challenge, entity_certificate.public_key()):
+                return False
+        else:
+            if not self.validate_rsa_signature(response, challenge, entity_certificate.public_key()):
+                return False        
         return True
